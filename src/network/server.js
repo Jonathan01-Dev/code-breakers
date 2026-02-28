@@ -3,7 +3,12 @@ const net = require('net');
 const TLV = {
     PEER_LIST: 0x02,
     KEEPALIVE_PING: 0x09,
-    KEEPALIVE_PONG: 0x0a
+    KEEPALIVE_PONG: 0x0a,
+    HANDSHAKE_HELLO: 0x10,
+    HANDSHAKE_HELLO_REPLY: 0x11,
+    HANDSHAKE_AUTH: 0x12,
+    HANDSHAKE_AUTH_OK: 0x13,
+    ENCRYPTED_MESSAGE: 0x20
 };
 
 function encodeFrame(type, payloadBuffer = Buffer.alloc(0)) {
@@ -30,6 +35,7 @@ function sendPeerList(host, port, payloadObj) {
 
 function startTcpServer(initialPort, handlers = {}) {
     const onPeerList = typeof handlers.onPeerList === 'function' ? handlers.onPeerList : () => {};
+    const onHandshakeFrame = typeof handlers.onHandshakeFrame === 'function' ? handlers.onHandshakeFrame : () => {};
     const onListening = typeof handlers.onListening === 'function' ? handlers.onListening : () => {};
     const maxOffset = Number(handlers.maxPortOffset || 20);
     let currentPort = Number(initialPort);
@@ -68,6 +74,15 @@ function startTcpServer(initialPort, handlers = {}) {
                     } catch (err) {
                         console.error('[TCP] PEER_LIST invalide:', err.message);
                     }
+                    continue;
+                }
+                if (type >= TLV.HANDSHAKE_HELLO && type <= TLV.HANDSHAKE_AUTH_OK) {
+                    onHandshakeFrame(type, payload, socket);
+                    continue;
+                }
+                if (type === TLV.ENCRYPTED_MESSAGE) {
+                    onHandshakeFrame(type, payload, socket);
+                    continue;
                 }
             }
         });
@@ -94,4 +109,4 @@ function startTcpServer(initialPort, handlers = {}) {
     return server;
 }
 
-module.exports = { startTcpServer, sendPeerList };
+module.exports = { startTcpServer, sendPeerList, encodeFrame, TLV };

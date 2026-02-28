@@ -1,11 +1,37 @@
+import errno
 import json
+import hashlib
 import os
 import socket
 import struct
+import sys
 import threading
 import time
-import hashlib
-from typing import Dict
+from pathlib import Path
+from typing import Dict, Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from crypto.chiffrement import SessionKeys, derive_session_keys, load_identity
+from crypto.handshake import (
+    AUTH,
+    AUTH_OK,
+    ENCRYPTED_MESSAGE,
+    HELLO,
+    HELLO_REPLY,
+    build_auth,
+    build_auth_ok,
+    build_hello,
+    build_hello_reply,
+    create_ephemeral_pair,
+    decode_public_key,
+    decrypt_encrypted_message,
+    handshake_signature_material,
+    verify_auth,
+    verify_signature,
+)
 
 MCAST_GRP = '239.255.42.99'
 MCAST_PORT = 6000
@@ -19,9 +45,20 @@ TYPE_HELLO = 0x01
 TYPE_PING = 0x02
 TYPE_PONG = 0x03
 
+DEFAULT_TCP_PORT = int(os.getenv('TCP_PORT', '7777'))
+TCP_PORT = DEFAULT_TCP_PORT
+
+def set_tcp_port(port: int) -> None:
+    global TCP_PORT
+    TCP_PORT = port
+
 TLV_PEER_LIST = 0x02
 TLV_KEEPALIVE_PING = 0x09
 TLV_KEEPALIVE_PONG = 0x0A
+
+identity = load_identity()
+sessions: Dict[str, SessionKeys] = {}
+handshake_contexts: Dict[str, dict] = {}
 
 peer_table: Dict[str, dict] = {}
 peer_lock = threading.Lock()
@@ -34,6 +71,10 @@ def _normalize_node_id(value: str) -> str:
     clean = ''.join(c for c in clean if c in '0123456789abcdef')
     clean = (clean + ('0' * 16))[:16]
     return '0x' + clean
+
+
+def current_tcp_port() -> int:
+    return TCP_PORT
 
 
 def load_node_id() -> str:
@@ -50,8 +91,9 @@ def load_node_id() -> str:
         except (OSError, json.JSONDecodeError):
             base_node_id = '0x_ERR000000000000'
 
-    # Avoid node-id collisions when multiple local instances share one keys file.
-    raw = f"{_normalize_node_id(base_node_id)}:{TCP_PORT}".encode('utf-8')
+    # Avoid node-id collisions when multiple machines share one keys file.
+    host_tag = (os.getenv('NODE_INSTANCE') or os.getenv('COMPUTERNAME') or socket.gethostname() or '').lower()
+    raw = f"{_normalize_node_id(base_node_id)}:{TCP_PORT}:{host_tag}".encode('utf-8')
     return '0x' + hashlib.sha256(raw).hexdigest()[:16]
 
 
@@ -86,6 +128,7 @@ def _upsert_peer(node_id: str, ip: str, tcp_port: int) -> None:
         }
     _save_peers()
     _print_peer_table()
+    _start_handshake(node_id, peer_table[node_id]['ip'], peer_table[node_id]['tcp_port'])
 
 
 def _cleanup_stale_peers() -> None:
@@ -103,13 +146,14 @@ def _cleanup_stale_peers() -> None:
             _save_peers()
 
 
-def _build_packet(msg_type: int, node_id: str, tcp_port: int) -> bytes:
+def _build_packet(msg_type: int, node_id: str, tcp_port: Optional[int] = None) -> bytes:
     node_hex = _normalize_node_id(node_id).replace('0x', '')
     node_bytes = bytes.fromhex(node_hex)
 
+    port = int(tcp_port or TCP_PORT)
     if msg_type == TYPE_HELLO:
         timestamp = int(time.time() * 1000)
-        return b'ARC' + bytes([0x01, TYPE_HELLO]) + node_bytes + struct.pack('>H', int(tcp_port)) + struct.pack('>Q', timestamp)
+        return b'ARC' + bytes([0x01, TYPE_HELLO]) + node_bytes + struct.pack('>H', port) + struct.pack('>Q', timestamp)
     return b'ARC' + bytes([0x01, msg_type]) + node_bytes
 
 
@@ -137,13 +181,33 @@ def _encode_tlv(msg_type: int, payload: bytes = b'') -> bytes:
     return bytes([msg_type]) + struct.pack('>I', len(payload)) + payload
 
 
+def _encode_handshake_frame(msg_type: int, payload: dict) -> bytes:
+    content = json.dumps(payload).encode('utf-8')
+    return _encode_tlv(msg_type, content)
+
+
+def _recv_frame(sock: socket.socket) -> tuple[int, bytes]:
+    header = sock.recv(5)
+    if len(header) < 5:
+        raise ConnectionError("Trame incomplète")
+    msg_type = header[0]
+    length = int.from_bytes(header[1:5], byteorder='big')
+    data = bytearray()
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            raise ConnectionError("Fin de stream")
+        data.extend(chunk)
+    return msg_type, bytes(data)
+
+
 def _send_peer_list_unicast(target_ip: str, target_port: int, my_id: str) -> None:
     with peer_lock:
         peers = list(peer_table.values())
 
     payload = {
         'from': my_id,
-        'tcp_port': TCP_PORT,
+        'tcp_port': current_tcp_port(),
         'peers': [
             {
                 'node_id': p['node_id'],
@@ -167,6 +231,148 @@ def _send_peer_list_unicast(target_ip: str, target_port: int, my_id: str) -> Non
         s.close()
 
 
+def _cleanup_handshake(node_id: str) -> None:
+    context = handshake_contexts.pop(node_id, None)
+    if context and context.get('socket'):
+        try:
+            context['socket'].close()
+        except OSError:
+            pass
+
+
+def _start_handshake(node_id: str, ip: str, tcp_port: int) -> None:
+    if not node_id or node_id in sessions or node_id in handshake_contexts:
+        return
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect((ip, tcp_port))
+    except OSError as exc:
+        print(f"[HANDSHAKE] Impossible de joindre {node_id}@{ip}:{tcp_port} ({exc})")
+        return
+
+    ephemeral = create_ephemeral_pair()
+    payload = build_hello(identity, ephemeral, current_tcp_port())
+    try:
+        sock.sendall(_encode_handshake_frame(HELLO, payload))
+        handshake_contexts[node_id] = {
+            'node_id': node_id,
+            'socket': sock,
+            'ephemeral': ephemeral,
+            'state': 'hello_sent',
+            'remote_pub': payload['permanent_pub'],
+            'remote_node': payload['node_id']
+        }
+        threading.Thread(target=_run_initiator_handshake, args=(node_id, ip, tcp_port), daemon=True).start()
+    except OSError:
+        sock.close()
+        print(f"[HANDSHAKE] Envoi HELLO vers {node_id} échoué")
+
+
+def _run_initiator_handshake(node_id: str, ip: str, tcp_port: int) -> None:
+    context = handshake_contexts.get(node_id)
+    if not context:
+        return
+    sock = context['socket']
+    try:
+        while True:
+            msg_type, payload_bytes = _recv_frame(sock)
+            payload = json.loads(payload_bytes.decode('utf-8'))
+
+            if msg_type == HELLO_REPLY:
+                _handle_hello_reply(node_id, sock, payload, context)
+            elif msg_type == AUTH_OK:
+                _handle_auth_ok(node_id, payload, context)
+                break
+            elif msg_type == ENCRYPTED_MESSAGE and context.get('session'):
+                _handle_encrypted_payload(payload)
+    except (ConnectionError, OSError, socket.timeout):
+        pass
+    finally:
+        _cleanup_handshake(node_id)
+
+
+def _handle_hello_reply(node_id: str, sock: socket.socket, payload: dict, context: dict) -> None:
+    try:
+        remote_eph = decode_public_key(payload.get('eph_pub', ''))
+    except Exception as err:
+        print(f"[HANDSHAKE] HELLO_REPLY eph invalide pour {node_id}: {err}")
+        return
+    local_bytes = bytes(context['ephemeral'].public_key)
+    hello_ts = payload.get('hello_timestamp', payload.get('timestamp', int(time.time() * 1000)))
+    material = handshake_signature_material(
+        initiator_node_id=context.get('remote_node', identity.machine_id),
+        responder_node_id=payload.get('node_id', ''),
+        initiator_eph=local_bytes,
+        responder_eph=bytes(remote_eph),
+        hello_timestamp=hello_ts
+    )
+    if not verify_signature(payload.get('signature', ''), material, payload.get('permanent_pub', '')):
+        print(f"[HANDSHAKE] Signature HELLO_REPLY invalide pour {node_id}")
+        return
+    shared_secret = context['ephemeral'].exchange(remote_eph)
+    session = derive_session_keys(shared_secret)
+    sessions[payload.get('node_id', node_id)] = session
+    context['session'] = session
+    sock.sendall(_encode_handshake_frame(AUTH, build_auth(identity, shared_secret)))
+
+
+def _handle_auth_ok(node_id: str, payload: dict, context: dict) -> None:
+    print(f"[HANDSHAKE] Session établie avec {node_id}")
+
+
+def _handle_encrypted_payload(frame: dict) -> None:
+    session = sessions.get(frame.get('from'))
+    if not session:
+        return
+    try:
+        plaintext = decrypt_encrypted_message(session, frame)
+        print(f"[MSG] Reçu {plaintext.decode('utf-8')}")
+    except Exception as err:
+        print(f"[MSG] Déchiffrement échoué: {err}")
+
+
+def _handle_server_hello(conn: socket.socket, payload: Dict, ctx: dict) -> None:
+    remote_node = payload.get('node_id')
+    remote_pub = payload.get('permanent_pub')
+    try:
+        remote_eph = decode_public_key(payload.get('eph_pub', ''))
+    except Exception as err:
+        print(f"[HANDSHAKE] HELLO entrant eph invalide ({remote_node}): {err}")
+        return
+    ctx['remote_node'] = remote_node
+    ctx['remote_pub'] = remote_pub
+    ctx['remote_eph'] = remote_eph
+    timestamp = payload.get('timestamp', int(time.time() * 1000))
+    reply = build_hello_reply(identity, remote_node, remote_eph, ctx['ephemeral'], current_tcp_port(), timestamp)
+    conn.sendall(_encode_handshake_frame(HELLO_REPLY, reply))
+
+
+def _handle_server_auth(conn: socket.socket, payload: Dict, ctx: dict) -> None:
+    if not ctx.get('remote_node') or not ctx.get('remote_pub') or not ctx.get('remote_eph'):
+        return
+    shared_secret = ctx['ephemeral'].exchange(ctx['remote_eph'])
+    if not verify_auth(payload.get('signature', ''), shared_secret, ctx['remote_pub']):
+        print(f"[HANDSHAKE] Auth signature invalide de {ctx['remote_node']}")
+        return
+    session = derive_session_keys(shared_secret)
+    sessions[ctx['remote_node']] = session
+    conn.sendall(_encode_handshake_frame(AUTH_OK, build_auth_ok(identity)))
+    print(f"[HANDSHAKE] Session serveur prête avec {ctx['remote_node']}")
+
+
+def _handle_server_encrypted(payload: Dict, ctx: dict) -> None:
+    node_id = payload.get('from')
+    session = sessions.get(node_id)
+    if not session:
+        return
+    try:
+        plaintext = decrypt_encrypted_message(session, payload)
+        print(f"[MSG] Serveur: {node_id} -> {plaintext.decode('utf-8')}")
+    except Exception as err:
+        print(f"[MSG] Serveur déchiffrement échoué: {err}")
+
+
 def diffuser_presence():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
@@ -175,7 +381,7 @@ def diffuser_presence():
     node_id = load_node_id()
     try:
         while True:
-            payload = _build_packet(TYPE_HELLO, node_id, TCP_PORT)
+            payload = _build_packet(TYPE_HELLO, node_id, current_tcp_port())
             try:
                 sock.sendto(payload, (MCAST_GRP, MCAST_PORT))
                 print(f"[HELLO] Presence diffusee: {node_id} tcp={TCP_PORT}")
@@ -231,7 +437,21 @@ def ecouter_multicast():
 def tcp_server():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', TCP_PORT))
+    selected_port = DEFAULT_TCP_PORT
+    try:
+        srv.bind(('0.0.0.0', DEFAULT_TCP_PORT))
+    except PermissionError as exc:
+        print(f"[TCP] Port {DEFAULT_TCP_PORT} interdit ({exc}); fallback vers un port aléatoire")
+        srv.bind(('0.0.0.0', 0))
+        selected_port = srv.getsockname()[1]
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            print(f"[TCP] Port {DEFAULT_TCP_PORT} indisponible ({exc}); fallback vers un port aléatoire")
+            srv.bind(('0.0.0.0', 0))
+            selected_port = srv.getsockname()[1]
+        else:
+            raise
+    set_tcp_port(selected_port)
     srv.listen(10)
     print(f"[TCP] Serveur en ecoute sur 0.0.0.0:{TCP_PORT}")
 
@@ -239,6 +459,13 @@ def tcp_server():
         conn.settimeout(None)
         buffer = b''
         stop_event = threading.Event()
+
+        handshake_ctx = {
+            'ephemeral': create_ephemeral_pair(),
+            'remote_node': None,
+            'remote_pub': None,
+            'remote_eph': None
+        }
 
         def keepalive_sender() -> None:
             while not stop_event.wait(15):
@@ -281,6 +508,17 @@ def tcp_server():
                             print(f"[PEER_LIST RX] de {remote} -> {len(msg.get('peers', []))} peers")
                         except (ValueError, TypeError):
                             pass
+                    elif msg_type in {HELLO, AUTH, ENCRYPTED_MESSAGE}:
+                        try:
+                            frame = json.loads(payload.decode('utf-8'))
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if msg_type == HELLO:
+                            _handle_server_hello(conn, frame, handshake_ctx)
+                        elif msg_type == AUTH:
+                            _handle_server_auth(conn, frame, handshake_ctx)
+                        elif msg_type == ENCRYPTED_MESSAGE:
+                            _handle_server_encrypted(frame, handshake_ctx)
         finally:
             stop_event.set()
             conn.close()
