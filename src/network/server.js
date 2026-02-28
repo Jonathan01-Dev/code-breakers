@@ -1,18 +1,97 @@
-// server.js
 const net = require('net');
 
-function startTcpServer(port) {
-    const server = net.createServer((socket) => {
-        console.log(`🔗 Connexion TCP entrante de ${socket.remoteAddress}`);
-        
-        socket.on('data', (data) => {
-            console.log("📦 Données TCP reçues :", data.toString());
-        });
-    });
+const TLV = {
+    PEER_LIST: 0x02,
+    KEEPALIVE_PING: 0x09,
+    KEEPALIVE_PONG: 0x0a
+};
 
-    server.listen(port, '0.0.0.0', () => {
-        console.log(`🚀 Serveur TCP prêt sur le port ${port}`);
-    });
+function encodeFrame(type, payloadBuffer = Buffer.alloc(0)) {
+    const len = payloadBuffer.length;
+    const frame = Buffer.alloc(1 + 4 + len);
+    frame.writeUInt8(type, 0);
+    frame.writeUInt32BE(len, 1);
+    if (len > 0) payloadBuffer.copy(frame, 5);
+    return frame;
 }
 
-module.exports = { startTcpServer };
+function sendPeerList(host, port, payloadObj) {
+    const payload = Buffer.from(JSON.stringify(payloadObj), 'utf8');
+    const frame = encodeFrame(TLV.PEER_LIST, payload);
+
+    const client = net.createConnection({ host, port }, () => {
+        client.write(frame);
+        client.end();
+    });
+    client.setTimeout(3000);
+    client.on('timeout', () => client.destroy());
+    client.on('error', () => {});
+}
+
+function startTcpServer(initialPort, handlers = {}) {
+    const onPeerList = typeof handlers.onPeerList === 'function' ? handlers.onPeerList : () => {};
+    const onListening = typeof handlers.onListening === 'function' ? handlers.onListening : () => {};
+    const maxOffset = Number(handlers.maxPortOffset || 20);
+    let currentPort = Number(initialPort);
+
+    const server = net.createServer((socket) => {
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, 15000);
+
+        let buffer = Buffer.alloc(0);
+        const keepAliveTimer = setInterval(() => {
+            if (!socket.destroyed) socket.write(encodeFrame(TLV.KEEPALIVE_PING));
+        }, 15000);
+
+        socket.on('data', (chunk) => {
+            buffer = Buffer.concat([buffer, chunk]);
+            while (buffer.length >= 5) {
+                const type = buffer.readUInt8(0);
+                const length = buffer.readUInt32BE(1);
+                if (length > 1024 * 1024) {
+                    socket.destroy();
+                    return;
+                }
+                if (buffer.length < 5 + length) break;
+
+                const payload = buffer.slice(5, 5 + length);
+                buffer = buffer.slice(5 + length);
+
+                if (type === TLV.KEEPALIVE_PING) {
+                    socket.write(encodeFrame(TLV.KEEPALIVE_PONG));
+                    continue;
+                }
+                if (type === TLV.PEER_LIST) {
+                    try {
+                        const message = JSON.parse(payload.toString('utf8'));
+                        onPeerList(message, socket.remoteAddress);
+                    } catch (err) {
+                        console.error('[TCP] PEER_LIST invalide:', err.message);
+                    }
+                }
+            }
+        });
+
+        const cleanup = () => clearInterval(keepAliveTimer);
+        socket.on('close', cleanup);
+        socket.on('end', cleanup);
+        socket.on('error', cleanup);
+    });
+
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE' && currentPort < Number(initialPort) + maxOffset) {
+            currentPort += 1;
+            console.warn(`[TCP] Port occupe, nouvel essai sur ${currentPort}`);
+            setTimeout(() => server.listen(currentPort, '0.0.0.0'), 200);
+            return;
+        }
+        console.error('[TCP] Erreur serveur:', err.message);
+    });
+    server.listen(currentPort, '0.0.0.0', () => {
+        onListening(currentPort);
+        console.log(`[TCP] Serveur d'ecoute actif sur 0.0.0.0:${currentPort}`);
+    });
+    return server;
+}
+
+module.exports = { startTcpServer, sendPeerList };

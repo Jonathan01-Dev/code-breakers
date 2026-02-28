@@ -35,6 +35,7 @@ Plaintext
            |           AUTRES NŒUDS VOISINS              |
            |      (PC connectés au même switch/Wi-Fi)    |
            |_____________________________________________|
+           
 
 Stack Technique & Répartition
 Python : Le Moteur de Sécurité
@@ -65,6 +66,6 @@ TCP_PORT=7777
 Bash
 node index.js
 
-💡 Pourquoi ce choix ?
+Pourquoi ce choix ?
 En isolant la sécurité en Python et le réseau en Node.js, Archipel offre une résilience maximale : si l'interface plante, le transfert continue. Si le réseau est instable, la cryptographie reste intègre.
 

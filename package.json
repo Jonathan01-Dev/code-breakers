@@ -12,7 +12,18 @@
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "io": "^1.5.8",
     "libsodium-wrappers": "^0.8.2",
+    "socket": "^1.1.65",
     "socket.io": "^4.8.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jonathan01-Dev/code-breakers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jonathan01-Dev/code-breakers/issues"
+  },
+  "homepage": "https://github.com/Jonathan01-Dev/code-breakers#readme"
 }

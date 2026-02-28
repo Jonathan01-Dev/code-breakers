@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Archipel | Control Center</title>
+    <link rel="stylesheet" href="index.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-left">
+            <div class="logo-icon">A</div>
+            <span class="brand-name">Archipel <span class="sub-brand">Network</span></span>
+        </div>
+        <div class="nav-right">
+            <div id="conn-status" class="status-badge"><span class="dot offline"></span> Deconnecte</div>
+            <div class="user-id">Mon ID: <span id="my-id" class="mono">0x...</span></div>
+        </div>
+    </nav>
+
+    <div class="dashboard-layout">
+        <main class="content-area">
+            <header class="section-header">
+                <h2>Noeuds a proximite</h2>
+                <div class="header-actions">
+                    <button class="btn-refresh" id="btn-scan">Scanner le reseau</button>
+                    <button class="btn-refresh" id="btn-clear">Effacer morts</button>
+                    <label class="filter-local">
+                        <input type="checkbox" id="chk-local" /> Meme sous-reseau uniquement
+                    </label>
+                </div>
+            </header>
+
+            <div id="peer-grid" class="peer-grid"></div>
+
+            <section class="transfers">
+                <h3>Transferts</h3>
+                <div id="transfers-list" class="transfers-list"></div>
+            </section>
+        </main>
+
+        <aside class="side-panel">
+            <div class="panel-section">
+                <h3>Console &amp; Logs</h3>
+                <div id="logs" class="log-viewer"></div>
+            </div>
+            <div class="panel-section">
+                <h3>Actions</h3>
+                <div class="action-list">
+                    <button id="btn-broadcast" class="btn-action">Envoyer HELLO</button>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <template id="peer-card-tpl">
+        <div class="peer-card">
+            <div class="card-header">
+                <div class="avatar">IP</div>
+                <div class="meta">
+                    <div class="peer-ip">0.0.0.0</div>
+                    <div class="id-hex">0x...</div>
+                </div>
+                <div class="actions">
+                    <button class="btn-ping small">PING</button>
+                    <button class="btn-connect small">CONNECT</button>
+                    <button class="btn-share small">ENVOYER</button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="status-text">Status: <span class="online">ONLINE</span></div>
+            </div>
+        </div>
+    </template>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
