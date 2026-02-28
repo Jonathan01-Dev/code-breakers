@@ -1,0 +1,26 @@
+[
+  {
+    "node_id": "0xb36ba09d2cb70c83",
+    "ip": "10.217.179.163",
+    "tcp_port": 49819,
+    "last_seen": 1772287620944,
+    "shared_files": [],
+    "reputation": 1.0
+  },
+  {
+    "node_id": "0xd413d80ff4528ecd",
+    "ip": "10.217.179.252",
+    "tcp_port": 44136,
+    "last_seen": 1772287560945,
+    "shared_files": [],
+    "reputation": 1.0
+  },
+  {
+    "node_id": "0x64b5dc11905e464c",
+    "ip": "10.217.179.163",
+    "tcp_port": 7777,
+    "last_seen": 1772287620942,
+    "shared_files": [],
+    "reputation": 1.0
+  }
+]

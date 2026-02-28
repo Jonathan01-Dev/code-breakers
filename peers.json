@@ -1,1 +1,22 @@
-[]
+[
+  {
+    "node_id": "0xb36ba09d2cb70c83",
+    "ip": "10.217.179.163",
+    "tcp_port": 49819,
+    "last_seen": 1772287674594,
+    "shared_files": [],
+    "reputation": 1,
+    "public_key": null,
+    "trust": "unknown"
+  },
+  {
+    "node_id": "0x04f1c19001104678",
+    "ip": null,
+    "tcp_port": 7777,
+    "last_seen": 1772287614621,
+    "shared_files": [],
+    "reputation": 1,
+    "public_key": "7b4979aec90a54ba32aa7c2444290c943932a1d44c162ca312a4543dfe34d427",
+    "trust": "tofu"
+  }
+]
