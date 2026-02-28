@@ -1,29 +1,35 @@
-// discovery.js
 const dgram = require('dgram');
-const { parseHello } = require('./packet');
+const { parsePacket } = require('./packet');
 
 const MULTICAST_ADDR = '239.255.42.99';
-const PORT = 6000;
+const MULTICAST_PORT = 6000;
 
-function startDiscovery(callback) {
+function startDiscovery(onHello, options = {}) {
+    const addr = options.multicastAddr || MULTICAST_ADDR;
+    const port = Number(options.multicastPort || MULTICAST_PORT);
     const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
     socket.on('message', (msg, rinfo) => {
-        const data = parseHello(msg);
-        if (data) {
-            // On renvoie les infos au chef d'orchestre (index.js)
-            callback({
-                id: data.nodeId,
+        const pkt = parsePacket(msg, options.defaultTcpPort || 7777);
+        if (!pkt || pkt.type !== 0x01) return;
+        if (typeof onHello === 'function') {
+            onHello({
+                id: pkt.nodeId,
                 ip: rinfo.address,
-                port: 7777 // Port par défaut pour le futur TCP
+                tcp_port: pkt.tcpPort,
+                version: pkt.version,
+                timestamp: pkt.timestamp
             });
         }
     });
 
-    socket.bind(PORT, () => {
-        socket.addMembership(MULTICAST_ADDR);
-        console.log(`📡 Radar UDP à l'écoute sur ${MULTICAST_ADDR}`);
+    socket.bind(port, () => {
+        socket.addMembership(addr);
+        socket.setBroadcast(true);
+        console.log(`[DISCOVERY] UDP multicast actif sur ${addr}:${port}`);
     });
+
+    return socket;
 }
 
 module.exports = { startDiscovery };

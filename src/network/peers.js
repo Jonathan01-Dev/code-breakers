@@ -1,20 +1,29 @@
 const peers = new Map();
 
-function updatePeerTable(id, ip) {
+function upsertPeer(id, ip, tcpPort = 7777) {
+    if (!id) return;
     peers.set(id, {
-        ip: ip,
+        id,
+        ip,
+        tcp_port: Number(tcpPort),
         lastSeen: Date.now()
     });
-    console.log(`✨ Voisin actif : ${id} @ ${ip}`);
 }
 
-// Nettoyage des machines inactives depuis 90s)
-setInterval(() => {
+function getPeers() {
+    return [...peers.values()];
+}
+
+function cleanupStalePeers(ttlMs = 90_000) {
     const now = Date.now();
-    for (const [id, info] of peers) {
-        if (now - info.lastSeen > 90000) {
+    const expired = [];
+    for (const [id, info] of peers.entries()) {
+        if (now - info.lastSeen > ttlMs) {
             peers.delete(id);
-            console.log(`💀 Voisin déconnecté : ${id}`);
+            expired.push(id);
         }
     }
-}, 10000);
+    return expired;
+}
+
+module.exports = { upsertPeer, getPeers, cleanupStalePeers };
