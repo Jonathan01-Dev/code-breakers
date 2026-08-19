@@ -1,0 +1,252 @@
+// Schéma de la base de données, écrit avec le langage Prisma.
+// Prisma lit ce fichier pour deux choses :
+// 1. `npx prisma migrate dev` : génère et exécute le SQL qui crée/modifie
+//    les tables dans PostgreSQL pour qu'elles correspondent à ce schéma.
+// 2. `npx prisma generate` : génère le client JS (@prisma/client) utilisé
+//    partout dans le backend (prisma.employee.findMany(), etc.) avec
+//    l'autocomplétion et les types correspondant exactement à ces modèles.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL") // lu depuis backend/.env
+}
+
+// --- Enums : listes de valeurs autorisées, deviennent des CHECK constraints en base ---
+
+// RH et RH_ASSISTANT ont exactement les mêmes droits dans l'application
+// (voir backend/src/index.js) ; on les distingue quand même en base pour
+// savoir "qui est qui" dans les listes d'utilisateurs et les logs d'audit.
+enum Role {
+  RH
+  RH_ASSISTANT
+  MANAGER
+}
+
+enum ContractType {
+  CDI
+  CDD
+}
+
+enum EmployeeStatus {
+  ACTIF
+  RETRAITE
+  QUITTE
+}
+
+enum DepartureReason {
+  DEMISSION
+  FIN_CDD
+  RETRAITE
+  LICENCIEMENT
+}
+
+enum AttendanceStatus {
+  PRESENT
+  RETARD
+  ABSENT
+}
+
+enum AttendanceMethod {
+  QR
+  MANUEL
+}
+
+// --- Modèles : chacun devient une table PostgreSQL ---
+
+// Compte de connexion à l'application (login/mot de passe). À ne pas
+// confondre avec Employee : un manager de site a un User pour se connecter,
+// mais n'a pas forcément de fiche Employee (ce n'est pas un salarié suivi
+// par le module RH, juste quelqu'un qui valide les présences le matin).
+model User {
+  id                Int       @id @default(autoincrement())
+  email             String    @unique
+  passwordHash      String // jamais le mot de passe en clair, toujours son hash bcrypt
+  name              String
+  role              Role
+  site              Site?     @relation(fields: [siteId], references: [id]) // renseigné seulement si role = MANAGER
+  siteId            Int?
+  passwordChangedAt DateTime? // invalide les JWT émis avant un reset / changement de mot de passe
+  createdAt         DateTime  @default(now())
+
+  // Un User (RH ou manager) peut avoir scanné plusieurs présences, et peut
+  // apparaître dans plusieurs lignes du journal d'audit.
+  scans       Attendance[]         @relation("ScannedBy")
+  auditLogs   AuditLog[]
+  resetTokens PasswordResetToken[]
+}
+
+// Jeton de réinitialisation : on stocke uniquement le hash SHA-256, jamais
+// le jeton en clair. Une fois utilisé ou expiré, il ne peut plus servir.
+model PasswordResetToken {
+  id        Int       @id @default(autoincrement())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// Site/agence de l'entreprise (ex: "Agence Assivito", "Kara"). Sert à
+// regrouper employés et managers, et à filtrer le registre de présence.
+model Site {
+  id        Int        @id @default(autoincrement())
+  name      String     @unique
+  employees Employee[]
+  users     User[]
+}
+
+// Fiche d'un salarié suivi par le module RH. C'est le modèle central : la
+// plupart des autres modèles (Contract, Attendance, STC...) pointent vers lui.
+model Employee {
+  id           Int            @id @default(autoincrement())
+  matricule    String         @unique // identifiant métier lisible (ex: "EMP-001"), utilisé aussi pour la saisie manuelle au scan
+  firstName    String
+  lastName     String
+  position     String
+  site         Site           @relation(fields: [siteId], references: [id])
+  siteId       Int
+  status       EmployeeStatus @default(ACTIF)
+  hireDate     DateTime
+  qrToken      String         @unique // identifiant secret encodé dans le QR Code du badge (voir scan.js)
+  qrActive     Boolean        @default(true) // passe à false automatiquement quand le STC est validé (départ)
+  createdAt    DateTime       @default(now())
+
+  // "1 Employee a plusieurs..." : Prisma matérialise ces relations grâce aux
+  // champs employeeId définis côté "plusieurs" (ex: Contract.employeeId).
+  contracts     Contract[]
+  careerMoves   CareerMove[]
+  leaveBalances LeaveBalance[]
+  absences      Absence[]
+  attendances   Attendance[]
+  stc           STC? // au plus un STC par employé (voir @unique sur STC.employeeId), donc relation "1 pour 1"
+}
+
+// Contrat de travail (CDI ou CDD). Un employé peut avoir plusieurs contrats
+// dans le temps (ex: plusieurs CDD successifs, ou un CDD suivi d'un CDI).
+model Contract {
+  id         Int          @id @default(autoincrement())
+  employee   Employee     @relation(fields: [employeeId], references: [id])
+  employeeId Int
+  type       ContractType
+  startDate  DateTime
+  endDate    DateTime? // null = contrat toujours en cours (typiquement un CDI)
+  salary     Decimal      @db.Decimal(12, 2) // Decimal plutôt que Float pour éviter les erreurs d'arrondi sur des montants d'argent
+  createdAt  DateTime     @default(now())
+}
+
+// Historique des mutations/changements de poste d'un employé (simple
+// journal chronologique, affiché dans l'onglet "Contrats & Carrière").
+model CareerMove {
+  id           Int      @id @default(autoincrement())
+  employee     Employee @relation(fields: [employeeId], references: [id])
+  employeeId   Int
+  date         DateTime
+  fromPosition String?
+  toPosition   String?
+  fromSite     String?
+  toSite       String?
+  notes        String?
+  createdAt    DateTime @default(now())
+}
+
+// Compteur de jours de congés d'un employé pour une année donnée.
+// Un employé a au plus une ligne par année (voir @@unique ci-dessous) :
+// c'est ce qui permet d'utiliser upsert() dans employees.js.
+model LeaveBalance {
+  id         Int      @id @default(autoincrement())
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  employeeId Int
+  year       Int
+  totalDays  Decimal  @db.Decimal(5, 2)
+  usedDays   Decimal  @db.Decimal(5, 2) @default(0)
+
+  @@unique([employeeId, year]) // contrainte : une seule ligne par (employé, année)
+}
+
+// Période d'absence (congé, maladie...). `justified` détermine si elle
+// bloque un pointage QR (voir scan.js) et si elle compte dans les
+// "congés en attente" du Dashboard quand elle ne l'est pas.
+model Absence {
+  id         Int      @id @default(autoincrement())
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  employeeId Int
+  startDate  DateTime
+  endDate    DateTime
+  type       String
+  justified  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+}
+
+// Un pointage = une présence enregistrée pour un employé, un jour donné.
+model Attendance {
+  id          Int               @id @default(autoincrement())
+  employee    Employee          @relation(fields: [employeeId], references: [id])
+  employeeId  Int
+  date        DateTime          @db.Date // jour seul (sans heure), utilisé pour la règle "un scan par jour"
+  time        DateTime          @default(now()) // horodatage précis du scan, pour l'affichage
+  siteName    String // dupliqué depuis Employee.site.name au moment du scan (évite un join pour les stats par site)
+  status      AttendanceStatus
+  method      AttendanceMethod
+  scannedBy   User?             @relation("ScannedBy", fields: [scannedById], references: [id]) // qui a fait le scan (RH ou manager)
+  scannedById Int?
+
+  // Contrainte clé du cahier des charges : "Un QR Code ne peut être scanné
+  // qu'une seule fois par jour." PostgreSQL refuse d'insérer une deuxième
+  // ligne avec le même (employeeId, date), donc la règle est garantie même
+  // en cas de bug côté application.
+  @@unique([employeeId, date])
+}
+
+// Solde de Tout Compte : calculé et généré une seule fois au moment du
+// départ d'un employé (voir stc.js). @unique sur employeeId => relation
+// 1-pour-1 avec Employee, on ne peut pas avoir deux STC pour la même personne.
+model STC {
+  id              Int             @id @default(autoincrement())
+  employee        Employee        @relation(fields: [employeeId], references: [id])
+  employeeId      Int             @unique
+  departureDate   DateTime
+  reason          DepartureReason
+  seniorityYears  Int
+  seniorityMonths Int
+  seniorityDays   Int
+  indemniteDepart Decimal         @db.Decimal(12, 2)
+  indemniteConges Decimal         @db.Decimal(12, 2)
+  totalAmount     Decimal         @db.Decimal(12, 2)
+  pdfPath         String?
+  notes           String?
+  validatedAt     DateTime        @default(now())
+}
+
+// Journal de traçabilité : "Garantir la traçabilité absolue de chaque
+// insertion, modification ou suppression de données" (cahier des charges).
+// Rempli manuellement via logAudit() depuis les routes qui modifient des
+// données sensibles. before/after sont des colonnes JSON "libres" (Json?)
+// car leur contenu change selon le type d'entité concernée.
+model AuditLog {
+  id         Int      @id @default(autoincrement())
+  user       User?    @relation(fields: [userId], references: [id])
+  userId     Int?
+  action     String // 'CREATE' | 'UPDATE' | 'DELETE' | 'VALIDATE' | 'IMPORT'
+  entityType String // 'Employee' | 'Contract' | 'Attendance' | 'STC' | 'User'...
+  entityId   Int?
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now())
+}
+
+// Une seule ligne (id = 1) : les paramètres RH configurables depuis
+// la page Réglages. `data` est un JSON libre fusionné avec les valeurs
+// par défaut du code (voir backend/src/settings.js).
+model HrSetting {
+  id        Int      @id @default(1)
+  data      Json
+  updatedAt DateTime @updatedAt
+  updatedBy Int?
+}

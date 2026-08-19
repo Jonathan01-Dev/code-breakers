@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "STC" ADD COLUMN IF NOT EXISTS "notes" TEXT;
